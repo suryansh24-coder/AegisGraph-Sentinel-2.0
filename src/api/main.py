@@ -107,6 +107,7 @@ from ..runtime import LifecycleManager, RuntimeState, RecoveryManager, RuntimeWa
 from ..runtime.background_tasks import honeypot_auto_release_loop
 from ..security import sanitize_payload
 from .adaptive_auth_routes import register_routes as register_adaptive_auth_routes
+from .archival_routes import register_routes as register_archival_routes
 from .schemas import (
     AccountOpeningRequest,
     AccountOpeningResponse,
@@ -1308,11 +1309,20 @@ def _start_runtime_background_tasks():
         name="honeypot_auto_release",
         owner="innovation.honeypot",
     )
+    # Start the daily archival scheduler (Issue #1477)
+    from ..archival.scheduler import start_archival_daemon
+    start_archival_daemon()
 
 
 async def _stop_runtime_background_tasks():
     _api_logger.info("Shutting down AegisGraph Sentinel 2.0...", event_type="shutdown_start")
     await state.tasks.cancel_all_tasks(timeout_seconds=10.0)
+    # Gracefully stop the archival scheduler daemon (Issue #1477)
+    try:
+        from ..archival.scheduler import get_archival_scheduler
+        get_archival_scheduler().stop(timeout=5.0)
+    except Exception:
+        pass
     _api_logger.info("Background tasks stopped cleanly", event_type="shutdown_complete")
 
 
@@ -1665,6 +1675,9 @@ app.add_middleware(SecurityHeadersMiddleware, hsts=_hsts_enabled)
 
 # Register adaptive authentication routes
 register_adaptive_auth_routes(app)
+
+# Register archival routes (Issue #1477 — automated data archival strategy)
+register_archival_routes(app)
 
 
 @app.get("/", tags=["Health"])
