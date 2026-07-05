@@ -1620,8 +1620,20 @@ async def prometheus_latency_middleware(request: Request, call_next):
     API_LATENCY.labels(endpoint=endpoint).observe(duration)
     return response
 
+_METRICS_TOKEN_HASH = os.getenv("AEGIS_METRICS_SCRAPE_TOKEN_HASH")
+
 @app.get("/metrics", tags=["System"])
-async def metrics():
+async def metrics(
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    if _METRICS_TOKEN_HASH:
+        token = None
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization[7:]
+        if not token or not hmac.compare_digest(
+            hashlib.sha256(token.encode()).hexdigest(), _METRICS_TOKEN_HASH
+        ):
+            raise HTTPException(status_code=401, detail="Invalid scrape token")
     try:
         manager = await get_honeypot_manager()
         active_count = len(manager.get_active_honeypots())
