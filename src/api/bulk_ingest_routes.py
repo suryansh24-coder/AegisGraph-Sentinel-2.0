@@ -14,8 +14,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import networkx as nx
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
-from src.api.schemas import (BulkIngestRequest, BulkIngestResponse,
-                             BulkIngestStatusResponse, BulkTaskProgress)
+from src.api.schemas import (
+    BulkIngestRequest,
+    BulkIngestResponse,
+    BulkIngestStatusResponse,
+    BulkTaskProgress,
+)
 from src.api.security import Role, require_role
 
 logger = logging.getLogger(__name__)
@@ -44,12 +48,22 @@ class BulkIngestionManager:
 
     def __init__(self):
         self.tasks: Dict[str, Dict[str, Any]] = {}
-        self.queue: asyncio.Queue[
-            Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]
-        ] = asyncio.Queue()
+        self._queue: Optional[asyncio.Queue] = None
         self.worker_task: Optional[asyncio.Task] = None
-        self._lock = asyncio.Lock()
+        self._lock_obj: Optional[asyncio.Lock] = None
         self.testing = False
+
+    @property
+    def queue(self) -> asyncio.Queue:
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+        return self._queue
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        if self._lock_obj is None:
+            self._lock_obj = asyncio.Lock()
+        return self._lock_obj
 
     def start_worker(self):
         """Start the background worker task if it's not already running."""
