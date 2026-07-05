@@ -83,6 +83,9 @@ class BulkIngestionManager:
                 pass
             self.worker_task = None
             logger.info("Bulk Ingestion background worker stopped.")
+        # Reset the queue and lock so that new ones are created for new event loops in tests
+        self._queue = None
+        self._lock_obj = None
 
     async def create_task(
         self,
@@ -126,6 +129,7 @@ class BulkIngestionManager:
                 break
             except Exception as e:
                 logger.error(f"Error reading from Bulk Ingestion Queue: {e}")
+                await asyncio.sleep(0.1)  # Yield control to prevent CPU spinning
                 continue
 
             async with self._lock:
