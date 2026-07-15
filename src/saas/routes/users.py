@@ -5,8 +5,10 @@ AegisGraph Sentinel Enterprise SaaS Platform
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, EmailStr, Field
+from src.saas.services.limit_enforcer import enforce_tenant_limit, get_tenant_resource_count, set_tenant_resource_count
+from src.saas.services.billing import PriceTier
 
 router = APIRouter(prefix="/api/v1/users", tags=["users"])
 
@@ -31,23 +33,26 @@ class UserUpdate(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
-    full_name: Optional[str]
-    username: Optional[str]
-    phone: Optional[str]
-    avatar_url: Optional[str]
+    full_name: Optional[str] = None
+    username: Optional[str] = None
+    phone: Optional[str] = None
+    avatar_url: Optional[str] = None
     role: str
     is_active: bool
     email_verified: bool
     mfa_enabled: bool
-    last_login: Optional[datetime]
+    last_login: Optional[datetime] = None
     created_at: datetime
 
 
 @router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def create_user(data: UserCreate):
+async def create_user(data: UserCreate, tenant_id: Optional[str] = None):
     """Create a new user"""
-    return UserResponse(
-        id=f"user_{datetime.utcnow().timestamp()}",
+    if tenant_id:
+        enforce_tenant_limit(tenant_id, "max_users", PriceTier.COMMUNITY)
+
+    user = UserResponse(
+        id=f"user_{datetime.now(timezone.utc).timestamp()}",
         email=data.email,
         full_name=data.full_name,
         username=data.username,
@@ -56,8 +61,14 @@ async def create_user(data: UserCreate):
         email_verified=False,
         mfa_enabled=False,
         last_login=None,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
+
+    if tenant_id:
+        current_count = get_tenant_resource_count(tenant_id, "max_users")
+        set_tenant_resource_count(tenant_id, "max_users", current_count + 1)
+
+    return user
 
 
 @router.get("/{user_id}", response_model=UserResponse)
@@ -73,8 +84,8 @@ async def get_user(user_id: str):
         is_active=True,
         email_verified=True,
         mfa_enabled=False,
-        last_login=datetime.utcnow(),
-        created_at=datetime.utcnow(),
+        last_login=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
     )
 
 
@@ -91,8 +102,8 @@ async def update_user(user_id: str, data: UserUpdate):
         is_active=True,
         email_verified=True,
         mfa_enabled=False,
-        last_login=datetime.utcnow(),
-        created_at=datetime.utcnow(),
+        last_login=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
     )
 
 
@@ -134,7 +145,7 @@ async def get_user_activity(user_id: str, limit: int = 50):
             {
                 "id": "act_1",
                 "action": "login",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "ip_address": "192.168.1.1",
                 "device": "Chrome on Windows",
             }

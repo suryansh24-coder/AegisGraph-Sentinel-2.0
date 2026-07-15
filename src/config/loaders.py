@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 import yaml
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 from . import defaults
 from .schemas import (
@@ -35,6 +38,10 @@ ENV_ALIASES = {
     "aegis_graph_path": "AEGIS_GRAPH_PATH",
     "aegis_graph_sha256": "AEGIS_GRAPH_SHA256",
     "redis_url": "REDIS_URL",
+    "backup_directory": "BACKUP_DIRECTORY",
+    "backup_encryption_key": "BACKUP_ENCRYPTION_KEY",
+    "backup_database_url": "BACKUP_DATABASE_URL",
+    "backup_tool_path": "BACKUP_TOOL_PATH",
     "aegis_config_path": "AEGIS_CONFIG_PATH",
     "aegis_thresholds_path": "AEGIS_THRESHOLDS_PATH",
     "api_host": "API_HOST",
@@ -49,8 +56,10 @@ ENV_ALIASES = {
     "prometheus_port": "PROMETHEUS_PORT",
     "discord_webhook_url": "DISCORD_WEBHOOK_URL",
     "slack_webhook_url": "SLACK_WEBHOOK_URL",
+    "teams_webhook_url": "TEAMS_WEBHOOK_URL",
     "enable_discord_webhook": "ENABLE_DISCORD_WEBHOOK",
     "enable_slack_webhook": "ENABLE_SLACK_WEBHOOK",
+    "enable_teams_webhook": "ENABLE_TEAMS_WEBHOOK",
     "enable_webhook_alerts": "ENABLE_WEBHOOK_ALERTS",
 }
 
@@ -129,7 +138,7 @@ def _bool_from_env(value: Optional[str], default: bool = False) -> bool:
     normalized = value.strip().lower()
 
     truthy = {"1", "true", "yes", "on"}
-    falsy = {"0", "false", "no", "off"}
+    falsy = {"0", "false", "no", "off", "release"}
 
     if normalized in truthy:
         return True
@@ -158,6 +167,7 @@ def _build_settings_dict(
     risk_config = dict(runtime_config.get("risk_scoring", {}))
     advanced_config = dict(runtime_config.get("advanced_features", {}))
     webhook_config = dict(runtime_config.get("webhook", {}))
+    runtime_policy_config = dict(runtime_config.get("runtime", {}))
 
     risk_thresholds = dict(risk_config.get("thresholds", {}))
     threshold_risk_config = thresholds_config.get("risk_scoring")
@@ -193,8 +203,10 @@ def _build_settings_dict(
     api_port_val = env.api_port or api_config.get("port", defaults.DEFAULT_API_PORT)
     try:
         api_port_val = int(api_port_val)
-    except (ValueError, TypeError):
-        pass
+    except (ValueError, TypeError) as exc:
+        logger.warning("Invalid api_port value %r, falling back to %s: %s",
+                       api_port_val, defaults.DEFAULT_API_PORT, exc)
+        api_port_val = defaults.DEFAULT_API_PORT
 
     api_reload_raw = api_config.get("reload")
     if api_reload_raw is None:
@@ -209,8 +221,10 @@ def _build_settings_dict(
     prometheus_port_val = env.prometheus_port or prometheus_config.get("port", defaults.DEFAULT_PROMETHEUS_PORT)
     try:
         prometheus_port_val = int(prometheus_port_val)
-    except (ValueError, TypeError):
-        pass
+    except (ValueError, TypeError) as exc:
+        logger.warning("Invalid prometheus_port value %r, falling back to %s: %s",
+                       prometheus_port_val, defaults.DEFAULT_PROMETHEUS_PORT, exc)
+        prometheus_port_val = defaults.DEFAULT_PROMETHEUS_PORT
 
     return {
         "api": {
@@ -240,6 +254,7 @@ def _build_settings_dict(
             "thresholds": risk_thresholds,
             "weights": risk_config.get("weights", defaults.DEFAULT_COMPONENT_WEIGHTS),
             "thresholds_path": thresholds_path,
+            "high_value_threshold": float(risk_config.get("high_value_threshold", 500000.0)),
         },
         "innovations": {
             "redis_url": env.redis_url,
@@ -292,8 +307,10 @@ def _build_settings_dict(
         "webhook": {
             "discord_url": env.discord_webhook_url or webhook_config.get("discord_url", defaults.DEFAULT_DISCORD_WEBHOOK_URL),
             "slack_url": env.slack_webhook_url or webhook_config.get("slack_url", defaults.DEFAULT_SLACK_WEBHOOK_URL),
+            "teams_url": env.teams_webhook_url or webhook_config.get("teams_url", defaults.DEFAULT_TEAMS_WEBHOOK_URL),
             "enable_discord": _bool_from_env(env.enable_discord_webhook, webhook_config.get("enable_discord", defaults.DEFAULT_ENABLE_DISCORD_WEBHOOK)) if env.enable_discord_webhook is not None else webhook_config.get("enable_discord", defaults.DEFAULT_ENABLE_DISCORD_WEBHOOK),
             "enable_slack": _bool_from_env(env.enable_slack_webhook, webhook_config.get("enable_slack", defaults.DEFAULT_ENABLE_SLACK_WEBHOOK)) if env.enable_slack_webhook is not None else webhook_config.get("enable_slack", defaults.DEFAULT_ENABLE_SLACK_WEBHOOK),
+            "enable_teams": _bool_from_env(env.enable_teams_webhook, webhook_config.get("enable_teams", defaults.DEFAULT_ENABLE_TEAMS_WEBHOOK)) if env.enable_teams_webhook is not None else webhook_config.get("enable_teams", defaults.DEFAULT_ENABLE_TEAMS_WEBHOOK),
             "enable_alerts": _bool_from_env(getattr(env, "enable_webhook_alerts", None), webhook_config.get("enable_alerts", defaults.DEFAULT_ENABLE_WEBHOOK_ALERTS)) if getattr(env, "enable_webhook_alerts", None) is not None else webhook_config.get("enable_alerts", defaults.DEFAULT_ENABLE_WEBHOOK_ALERTS),
         },
         "runtime": {
@@ -301,6 +318,11 @@ def _build_settings_dict(
             "debug": _bool_from_env(env.debug, default=False),
             "strict_validation": None,
             "config_path": config_path,
+            "failure_mode": (
+                (env.runtime_failure_mode or runtime_policy_config.get("failure_mode", "degraded"))
+                .strip()
+                .lower()
+            ),
         },
         "raw_config": runtime_config,
         "raw_environment": env,
@@ -338,6 +360,7 @@ def load_settings(
             thresholds=ScoringThresholdSettings(**settings_dict["scoring"]["thresholds"]),
             weights=settings_dict["scoring"]["weights"],
             thresholds_path=settings_dict["scoring"]["thresholds_path"],
+            high_value_threshold=settings_dict["scoring"]["high_value_threshold"],
         ),
         innovations=InnovationSettings(**settings_dict["innovations"]),
         webhook=WebhookSettings(**settings_dict["webhook"]),

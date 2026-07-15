@@ -28,6 +28,10 @@ class EnvironmentVariablesSchema(ConfigBaseModel):
     aegis_graph_path: Optional[str] = Field(default=None, description="Optional verified graph artifact path.")
     aegis_graph_sha256: Optional[str] = Field(default=None, description="Expected SHA256 for graph artifact.")
     redis_url: Optional[str] = Field(default=None, description="Optional Redis backend URL.")
+    backup_directory: Optional[str] = Field(default=None, description="Directory for encrypted database backups.")
+    backup_encryption_key: Optional[str] = Field(default=None, description="Base64-encoded 32-byte backup encryption key.")
+    backup_database_url: Optional[str] = Field(default=None, description="Database URL to back up. Defaults to DATABASE_URL.")
+    backup_tool_path: Optional[str] = Field(default=None, description="Optional override for pg_dump or neo4j-admin path.")
     aegis_config_path: Optional[str] = Field(default=None, description="Optional runtime YAML path.")
     aegis_thresholds_path: Optional[str] = Field(default=None, description="Optional thresholds YAML path.")
     api_host: Optional[str] = Field(default=None, description="API host address (default: 0.0.0.0).")
@@ -42,9 +46,15 @@ class EnvironmentVariablesSchema(ConfigBaseModel):
     prometheus_port: Optional[str] = Field(default=None, description="Prometheus metrics port (default: 9090).")
     discord_webhook_url: Optional[str] = Field(default=None, description="Discord Webhook URL for alerts.")
     slack_webhook_url: Optional[str] = Field(default=None, description="Slack Webhook URL for alerts.")
+    teams_webhook_url: Optional[str] = Field(default=None, description="Teams Webhook URL for alerts.")
     enable_discord_webhook: Optional[str] = Field(default=None, description="Enable/disable Discord webhook alerts.")
     enable_slack_webhook: Optional[str] = Field(default=None, description="Enable/disable Slack webhook alerts.")
+    enable_teams_webhook: Optional[str] = Field(default=None, description="Enable/disable Teams webhook alerts.")
     enable_webhook_alerts: Optional[str] = Field(default=None, description="Global kill-switch: enable/disable ALL webhook alerts (ENABLE_WEBHOOK_ALERTS).")
+    runtime_failure_mode: Optional[str] = Field(
+        default=None,
+        description="Runtime failure policy override (fail_fast, degraded, maintenance).",
+    )
 
     @property
     def runtime_environment(self) -> str:
@@ -135,8 +145,10 @@ class WebhookSettings(ConfigBaseModel):
 
     discord_url: str = Field(default=defaults.DEFAULT_DISCORD_WEBHOOK_URL)
     slack_url: str = Field(default=defaults.DEFAULT_SLACK_WEBHOOK_URL)
+    teams_url: str = Field(default=defaults.DEFAULT_TEAMS_WEBHOOK_URL)
     enable_discord: bool = Field(default=defaults.DEFAULT_ENABLE_DISCORD_WEBHOOK)
     enable_slack: bool = Field(default=defaults.DEFAULT_ENABLE_SLACK_WEBHOOK)
+    enable_teams: bool = Field(default=defaults.DEFAULT_ENABLE_TEAMS_WEBHOOK)
     enable_alerts: bool = Field(default=defaults.DEFAULT_ENABLE_WEBHOOK_ALERTS)
 
     @field_validator("discord_url")
@@ -161,6 +173,17 @@ class WebhookSettings(ConfigBaseModel):
             )
         return value
 
+    @field_validator("teams_url")
+    @classmethod
+    def validate_teams_url(cls, value: str) -> str:
+        """Validate Teams webhook URL schema."""
+        if value and not value.startswith("https://"):
+            raise ValueError(
+                "TEAMS_WEBHOOK_URL must be a full HTTPS URL "
+                "(e.g. https://outlook.office.com/webhook/…)"
+            )
+        return value
+
 
 class GraphRuntimeSettings(ConfigBaseModel):
     graph_path: Path = Field(default=defaults.DEFAULT_GRAPH_PATH)
@@ -170,33 +193,6 @@ class GraphRuntimeSettings(ConfigBaseModel):
     k_hop_neighbors: int = Field(default=3, ge=1)
     max_subgraph_nodes: int = Field(default=1000, ge=1)
     max_subgraph_edges: int = Field(default=5000, ge=1)
-    @model_validator(mode="after")
-    def validate_graph_limits(self):
-        if self.max_subgraph_edges < self.max_subgraph_nodes:
-            raise ValueError(
-                "max_subgraph_edges must be greater than or equal to max_subgraph_nodes"
-            )
-
-        return self
-    @model_validator(mode="after")
-    def validate_graph_limits(self):
-        if self.max_subgraph_edges < self.max_subgraph_nodes:
-            raise ValueError(
-                "max_subgraph_edges must be greater than or equal to max_subgraph_nodes"
-            )
-
-        if self.max_subgraph_nodes < 10:
-            raise ValueError(
-                "max_subgraph_nodes must be at least 10"
-            )
-
-        if self.max_subgraph_edges < 10:
-            raise ValueError(
-                "max_subgraph_edges must be at least 10"
-            )
-
-        return self
-
     @model_validator(mode="after")
     def validate_graph_limits(self):
         if self.max_subgraph_edges < self.max_subgraph_nodes:
@@ -244,6 +240,7 @@ class ScoringSettings(ConfigBaseModel):
     thresholds: ScoringThresholdSettings = Field(default_factory=ScoringThresholdSettings)
     weights: Dict[str, float] = Field(default_factory=lambda: dict(defaults.DEFAULT_COMPONENT_WEIGHTS))
     thresholds_path: Path = Field(default=defaults.DEFAULT_THRESHOLDS_PATH)
+    high_value_threshold: float = Field(default=500000.0, ge=0.0)
 
 
 class InnovationSettings(ConfigBaseModel):
@@ -284,6 +281,18 @@ class RuntimeFlags(ConfigBaseModel):
     debug: bool = Field(default=False)
     strict_validation: Optional[bool] = Field(default=None)
     config_path: Path = Field(default=defaults.DEFAULT_CONFIG_PATH)
+    failure_mode: str = Field(default="degraded")
+
+    @field_validator("failure_mode")
+    @classmethod
+    def validate_failure_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"fail_fast", "degraded", "maintenance"}
+        if normalized not in allowed:
+            raise ValueError(
+                "failure_mode must be one of: fail_fast, degraded, maintenance"
+            )
+        return normalized
 
     @property
     def is_production(self) -> bool:

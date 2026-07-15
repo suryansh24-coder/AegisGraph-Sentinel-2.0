@@ -10,6 +10,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
@@ -26,8 +27,15 @@ from typing import Any, Dict, List, Optional
 
 from ..lru_cache import LRUCache
 
+logger = logging.getLogger(__name__)
+
 import networkx as nx
 import numpy as np
+import concurrent.futures
+import os
+
+# Dedicated thread pool for CPU-bound ML inference
+inference_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(4, (os.cpu_count() or 1)))
 import uvicorn
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,6 +99,73 @@ except ImportError as e:
     )
 
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse
+
+class DefaultRateLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware to enforce default rate limits on standard API endpoints."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Only rate limit if slowapi is available and limiter is configured
+        limiter = getattr(request.app.state, "limiter", None)
+        if not SLOWAPI_AVAILABLE or not limiter:
+            return await call_next(request)
+
+        path = request.url.path
+
+        # Standard API routes start with /api/ or equal /stats, excluding health, metrics, docs, etc.
+        exempt_paths = {
+            "/",
+            "/health",
+            "/health/liveness",
+            "/api/v1/health",
+            "/metrics",
+            "/docs",
+            "/redoc",
+            "/openapi.json",
+        }
+
+        is_standard_route = path.startswith("/api/") or path == "/stats"
+        is_exempt = path in exempt_paths
+
+        if is_standard_route and not is_exempt:
+            try:
+                import limits
+                # Securely get client IP
+                client_ip = get_remote_address(request)
+
+                # Get the default rate limit string from settings
+                runtime_settings = get_settings()
+                rate_limit_str = runtime_settings.api.rate_limit
+
+                # Parse the limit using limits library
+                parsed_limit = limits.parse(rate_limit_str)
+
+                # Check rate limit using the default key_func (IP address)
+                # Use 'default_limit' namespace prefix to isolate state from other decorators
+                allowed = limiter.limiter.hit(parsed_limit, client_ip, "default_limit")
+
+                if not allowed:
+                    # Get reset time to calculate Retry-After header
+                    stats = limiter.limiter.get_window_stats(parsed_limit, client_ip, "default_limit")
+                    retry_after = max(1, int(stats.reset_time - time.time()))
+
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "error": {
+                                "code": 429,
+                                "message": f"Rate limit exceeded: {rate_limit_str}. Please try again later."
+                            }
+                        },
+                        headers={"Retry-After": str(retry_after)}
+                    )
+            except Exception as exc:
+                # Log error and continue to ensure availability if rate limiter logic fails
+                logger.error(f"Error in rate limiting middleware: {exc}", exc_info=True)
+
+        return await call_next(request)
+
 
 from ..config.settings import get_settings
 from ..config.validation import validate_environment
@@ -107,6 +182,18 @@ from ..runtime import LifecycleManager, RuntimeState, RecoveryManager, RuntimeWa
 from ..runtime.background_tasks import honeypot_auto_release_loop
 from ..security import sanitize_payload
 from .adaptive_auth_routes import register_routes as register_adaptive_auth_routes
+from .archival_routes import register_routes as register_archival_routes
+from .agent_routes import router as agent_router
+from .decision_routes import router as decision_router
+from .bulk_ingest_routes import router as bulk_ingest_router
+from src.phase_61_autonomous_security_knowledge_graph_engine.api import router as phase61_router
+from src.phase_62_cross_domain_investigation_orchestrator.api import router as phase62_router
+from src.phase_63_enterprise_security_decision_intelligence_platform.api import router as phase63_router
+from src.phase_64_autonomous_threat_simulation_platform.api import router as phase64_router
+from src.phase_66_autonomous_compliance_validation_platform.api import router as phase66_router
+from src.phase_67_global_threat_forecasting_engine.api import router as phase67_router
+from .warfare_routes import router as warfare_router
+
 from .schemas import (
     AccountOpeningRequest,
     AccountOpeningResponse,
@@ -376,9 +463,15 @@ def _build_health_response(include_details: bool) -> dict[str, Any]:
     if health_monitor is not None:
         overall_status = health_monitor.get_overall_status()
 
+    runtime_mode = getattr(getattr(runtime_state, "settings", None), "runtime", None)
+    failure_mode = getattr(runtime_mode, "failure_mode", "degraded")
+    if failure_mode == "maintenance" and overall_status == "healthy":
+        overall_status = "maintenance"
+
     response: dict[str, Any] = {
         "status": overall_status,
         "service": "AegisGraph Sentinel",
+        "runtime_mode": failure_mode,
     }
 
     start_time = getattr(runtime_state, "start_time", None)
@@ -808,14 +901,27 @@ def _resolve_model_components() -> tuple[Any, Any, bool]:
     return model_compute_risk_score, model_generate_explanation, True
 
 
+def _has_runtime_graph() -> bool:
+    return bool(
+        getattr(state, "graph_loaded", False)
+        and getattr(state, "transaction_graph", None) is not None
+    )
+
+
 def compute_risk_score(*args, **kwargs):
     global _compute_risk_score_impl, _generate_explanation_impl
-    if (
-        "transaction_graph" not in kwargs
-        and getattr(state, "graph_loaded", False)
-        and getattr(state, "transaction_graph", None) is not None
-    ):
+    runtime_graph_ready = _has_runtime_graph()
+    if not MODEL_AVAILABLE or not runtime_graph_ready:
         return _fallback_compute_risk_score(*args, **kwargs)
+
+    kwargs.setdefault("graph_loaded", getattr(state, "graph_loaded", False))
+    kwargs.setdefault("transaction_graph", getattr(state, "transaction_graph", None))
+    kwargs.setdefault("mule_accounts", getattr(state, "mule_accounts", set()))
+    kwargs.setdefault("centrality_baseline", getattr(state, "centrality_baseline", {}))
+    kwargs.setdefault("centrality_window_size", getattr(state, "centrality_window_size", 10))
+    kwargs.setdefault("account_profiles", getattr(state, "account_profiles", {}))
+    kwargs.setdefault("config", getattr(state, "config", {}))
+
     if _compute_risk_score_impl is None:
         _compute_risk_score_impl, _generate_explanation_impl, _ = _resolve_model_components()
     return _compute_risk_score_impl(*args, **kwargs)
@@ -919,7 +1025,7 @@ class AppState:
         # Graph-based fraud detection
         self.transaction_graph = None
         self.fraud_chains = []
-        self.mule_accounts = {'mule_acc_001', 'mule_acc_002', 'test_merchant', 'suspect_account_1', 'fraud_wallet_xyz'}
+        self.mule_accounts = set()
         self.account_profiles = {}
         self.graph_loaded = False
         # Lateral movement detection - rolling betweenness centrality baseline
@@ -995,14 +1101,6 @@ def _initialize_model_components() -> None:
 _initialize_model_components()
 
 
-def _get_metrics_lock() -> asyncio.Lock:
-    metrics_lock = getattr(state, "metrics_lock", None)
-    if metrics_lock is None:
-        metrics_lock = asyncio.Lock()
-        state.metrics_lock = metrics_lock
-    return metrics_lock
-
-
 async def _honeypot_auto_release_loop(interval_seconds: int = 60):
     await honeypot_auto_release_loop(
         lambda: state.services.optional_get("honeypot_manager"),
@@ -1061,6 +1159,7 @@ def _read_json_file(path: Path) -> Any:
 
 async def _load_graph_runtime_data(startup_logger):
     try:
+        failure_mode = state.settings.runtime.failure_mode
         # === NEO4J DATABASE INITIALIZATION ===
         db_config = state.config.get("database", {})
         neo4j_config = db_config.get("neo4j", {})
@@ -1116,7 +1215,10 @@ async def _load_graph_runtime_data(startup_logger):
                 startup_logger.warning(
                     "Neo4j enabled but connection failed. Falling back to static graph files.",
                     event_type="neo4j_fallback",
+                    metadata={"failure_mode": failure_mode},
                 )
+                if failure_mode == "fail_fast":
+                    raise RuntimeError("Neo4j initialization failed and fail-fast mode is enabled")
 
         # === SECURE GRAPH LOADING (Fallback) ===
         if not state.graph_loaded:
@@ -1180,6 +1282,8 @@ async def _load_graph_runtime_data(startup_logger):
                     event_type="graph_file_missing",
                     metadata={"expected_path": "data/synthetic/graph.graphml"},
                 )
+                if failure_mode == "fail_fast":
+                    raise RuntimeError("Graph artifact missing and fail-fast mode is enabled")
             
             if not graph_path:
                 state.graph_loaded = False
@@ -1215,11 +1319,15 @@ async def _load_graph_runtime_data(startup_logger):
             startup_logger.warning("Accounts file not found", event_type="accounts_missing")
 
     except Exception as e:
+        failure_mode = state.settings.runtime.failure_mode
         startup_logger.warning(
             f"Error loading graph data: {e}",
             event_type="graph_load_error",
+            metadata={"failure_mode": failure_mode},
         )
         state.graph_loaded = False
+        if failure_mode == "fail_fast":
+            raise
     register_graph_services(
         state.services,
         state.transaction_graph,
@@ -1308,11 +1416,20 @@ def _start_runtime_background_tasks():
         name="honeypot_auto_release",
         owner="innovation.honeypot",
     )
+    # Start the daily archival scheduler (Issue #1477)
+    from ..archival.scheduler import start_archival_daemon
+    start_archival_daemon()
 
 
 async def _stop_runtime_background_tasks():
     _api_logger.info("Shutting down AegisGraph Sentinel 2.0...", event_type="shutdown_start")
     await state.tasks.cancel_all_tasks(timeout_seconds=10.0)
+    # Gracefully stop the archival scheduler daemon (Issue #1477)
+    try:
+        from ..archival.scheduler import get_archival_scheduler
+        get_archival_scheduler().stop(timeout=5.0)
+    except Exception:
+        pass
     _api_logger.info("Background tasks stopped cleanly", event_type="shutdown_complete")
 
 
@@ -1523,10 +1640,20 @@ async def lifespan(app: FastAPI):
             
     stale_cleanup_task = asyncio.create_task(_stale_cleanup_loop())
 
+    # Start bulk ingestion worker
+    from .bulk_ingest_routes import bulk_ingestion_manager
+    bulk_ingestion_manager.start_worker()
+
     await lifecycle_manager.startup()
     try:
         yield
     finally:
+        # Stop bulk ingestion worker
+        try:
+            await bulk_ingestion_manager.stop_worker()
+        except Exception as e:
+            logger.error(f"Error stopping bulk ingestion worker: {e}")
+
         stale_cleanup_task.cancel()
         try:
             await stale_cleanup_task
@@ -1583,6 +1710,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from src.saas.routes.users import router as saas_users_router
+app.include_router(saas_users_router)
+
 TRANSACTION_DECISIONS = REGISTRY._names_to_collectors.get("aegis_transaction_decisions_total") or Counter(
     "aegis_transaction_decisions_total",
     "Total transaction decisions made by AegisGraph",
@@ -1608,13 +1738,25 @@ async def prometheus_latency_middleware(request: Request, call_next):
     return response
 
 @app.get("/metrics", tags=["System"])
-async def metrics():
+async def metrics(
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    token_hash = os.getenv("AEGIS_METRICS_SCRAPE_TOKEN_HASH")
+    if token_hash:
+        token = None
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization[7:]
+        if not token or not hmac.compare_digest(
+            hashlib.sha256(token.encode()).hexdigest(), token_hash
+        ):
+            raise HTTPException(status_code=401, detail="Invalid scrape token")
     try:
         manager = await get_honeypot_manager()
         active_count = len(manager.get_active_honeypots())
         ACTIVE_HONEYPOTS.set(active_count)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Failed to collect honeypot metrics: %s", exc)
+        ACTIVE_HONEYPOTS.set(0)
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
@@ -1647,12 +1789,13 @@ app.add_middleware(
 # Rate Limiting
 limiter = Limiter(
     key_func=get_remote_address,
-    default_limits=["100/minute"],
+    default_limits=[],
 )
 app.state.limiter = limiter
 if SLOWAPI_AVAILABLE:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
+    app.add_middleware(DefaultRateLimitMiddleware)
 
 register_exception_handlers(app)
 register_observability_middleware(app)
@@ -1665,6 +1808,26 @@ app.add_middleware(SecurityHeadersMiddleware, hsts=_hsts_enabled)
 
 # Register adaptive authentication routes
 register_adaptive_auth_routes(app)
+
+# Register archival routes (Issue #1477 — automated data archival strategy)
+register_archival_routes(app)
+
+# Register Agent Swarm routes (Issue #1494)
+app.include_router(agent_router)
+# Register Decision Intelligence routes (Issue #1496)
+app.include_router(decision_router)
+# Register Bulk Ingestion routes
+app.include_router(bulk_ingest_router)
+# Register Phase 61-67 module routes (Issue #1508)
+app.include_router(phase61_router)
+app.include_router(phase62_router)
+app.include_router(phase63_router)
+app.include_router(phase64_router)
+app.include_router(phase66_router)
+app.include_router(phase67_router)
+# Register Cyber-Fraud Warfare routes (Issue #1507)
+app.include_router(warfare_router)
+
 
 
 @app.get("/", tags=["Health"])
@@ -1727,7 +1890,7 @@ async def get_stats():
     
     Returns detailed statistics about processed transactions
     """
-    async with _get_metrics_lock():
+    async with state.metrics_lock:
         uptime = time.time() - state.start_time
         
         avg_risk = (state.total_risk_score / state.requests_processed 
@@ -1776,7 +1939,7 @@ def _analyze_keystrokes_sync(biometrics: dict) -> bool:
     tags=["Detection"],
     summary="Check transaction for fraud",
     description="Analyze a single transaction for fraud risk using HTGNN and behavioral biometrics",
-    dependencies=[Depends(require_role(Role.ANALYST)), Depends(StrictRateLimit(ip_limit=60, api_key_limit=300))]
+    dependencies=[Depends(StrictRateLimit(ip_limit=60, api_key_limit=300)), Depends(require_role(Role.ANALYST))]
 )
 async def check_transaction(
     request: TransactionCheckRequest,
@@ -1800,47 +1963,66 @@ async def check_transaction(
         # Prepare transaction data
         transaction = request.model_dump()
         
-        # Prepare biometrics data
-        biometrics = None
+        # Check IP/location blacklist
+        from src.features.ip_blacklist import check_blacklist
         behavioral_stress_detected = False
-        if request.biometrics:
-            biometrics = {
-                'hold_times': request.biometrics.hold_times,
-                'flight_times': request.biometrics.flight_times,
+        if check_blacklist(request.ip_address, request.location):
+            risk_result = {
+                "risk_score": 1.0,
+                "decision": "BLOCK",
+                "confidence": 1.0,
+                "breakdown": {
+                    "graph": 1.0,
+                    "velocity": 1.0,
+                    "behavior": 1.0,
+                    "entropy": 1.0,
+                }
             }
+            explanation_result = {
+                "explanation": "❌ IMMEDIATE BLOCK: Source IP or transaction location is blacklisted due to high compliance and security risk.",
+                "recommended_action": "REJECT TRANSACTION: High fraud probability - immediate intervention required"
+            }
+        else:
+            # Prepare biometrics data
+            biometrics = None
+            if request.biometrics:
+                biometrics = {
+                    'hold_times': request.biometrics.hold_times,
+                    'flight_times': request.biometrics.flight_times,
+                }
+                
+                # Innovation 1: Simple keystroke stress detection
+                if INNOVATIONS_AVAILABLE:
+                    try:
+                        behavioral_stress_detected = await asyncio.get_running_loop().run_in_executor(inference_pool, _analyze_keystrokes_sync, biometrics)
+                    except Exception as e:
+                        _api_logger.warning(
+                            f"Keystroke analysis failed: {e}",
+                            event_type="keystroke_analysis_error",
+                        )
             
-            # Innovation 1: Simple keystroke stress detection
-            if INNOVATIONS_AVAILABLE:
-                try:
-                    behavioral_stress_detected = await asyncio.to_thread(_analyze_keystrokes_sync, biometrics)
-                except Exception as e:
-                    _api_logger.warning(
-                        f"Keystroke analysis failed: {e}",
-                        event_type="keystroke_analysis_error",
-                    )
-        
-        # Offload CPU-bound scoring + graph analysis to thread pool.
-        # When called from the batch endpoint, _batch_subgraph_cache and
-        # _batch_subgraph_lock are set via context variables so that subgraph
-        # extractions for the same source account are shared across concurrent
-        # tasks within the same batch, reducing graph traversals from O(N) to
-        # O(unique source accounts).
-        loop = asyncio.get_running_loop()
-        subgraph_cache = _batch_subgraph_cache.get()
-        subgraph_lock = _batch_subgraph_lock.get()
-        risk_result = await asyncio.to_thread(_run_scoring_pipeline, transaction,
-                biometrics,
-                request.source_account,
-                request.target_account,
-                lateral_movement_detector if LATERAL_MOVEMENT_AVAILABLE else None,
-                INNOVATIONS_AVAILABLE,
-                subgraph_cache,
-                subgraph_lock,)
+            # Offload CPU-bound scoring + graph analysis to thread pool.
+            # When called from the batch endpoint, _batch_subgraph_cache and
+            # _batch_subgraph_lock are set via context variables so that subgraph
+            # extractions for the same source account are shared across concurrent
+            # tasks within the same batch, reducing graph traversals from O(N) to
+            # O(unique source accounts).
+            loop = asyncio.get_running_loop()
+            subgraph_cache = _batch_subgraph_cache.get()
+            subgraph_lock = _batch_subgraph_lock.get()
+            risk_result = await loop.run_in_executor(inference_pool, _run_scoring_pipeline, transaction,
+                    biometrics,
+                    request.source_account,
+                    request.target_account,
+                    lateral_movement_detector if LATERAL_MOVEMENT_AVAILABLE else None,
+                    INNOVATIONS_AVAILABLE,
+                    subgraph_cache,
+                    subgraph_lock,)
 
-        # Generate explanation off the event loop to keep the request thread responsive.
-        explanation_result = await asyncio.to_thread(generate_explanation, transaction=transaction,
-                risk_result=risk_result,
-                detail_level='high',)
+            # Generate explanation off the event loop to keep the request thread responsive.
+            explanation_result = await loop.run_in_executor(inference_pool, partial(generate_explanation, transaction=transaction,
+                    risk_result=risk_result,
+                    detail_level='high'))
         
         # Innovation 2: Check if honeypot should be activated
         honeypot_activated = False
@@ -1991,7 +2173,7 @@ async def check_transaction(
                 },
             )
 
-        async with _get_metrics_lock():
+        async with state.metrics_lock:
             # Update statistics AFTER amount-scaling override so stats
             # always reflect the final decision returned to the caller.
             state.requests_processed += 1
@@ -2287,7 +2469,7 @@ async def fraud_stream_websocket(websocket: WebSocket, client_id: str):
     tags=["Detection"],
     summary="Check multiple transactions",
     description="Batch processing of multiple transactions for fraud detection",
-    dependencies=[Depends(require_role(Role.ANALYST)), Depends(StrictRateLimit(ip_limit=10, api_key_limit=50))]
+    dependencies=[Depends(StrictRateLimit(ip_limit=10, api_key_limit=50)), Depends(require_role(Role.ANALYST))]
 )
 async def check_batch_transactions(request: BatchTransactionRequest):
     """
@@ -2428,7 +2610,7 @@ async def get_model_info():
     tags=["Detection"],
     summary="Analyze voice stress during transaction",
     description="Innovation 5: Real-time voice stress analysis to detect coercion or AI generation",
-    dependencies=[Depends(require_role(Role.ANALYST)), Depends(StrictRateLimit(ip_limit=5, api_key_limit=20))]
+    dependencies=[Depends(StrictRateLimit(ip_limit=5, api_key_limit=20)), Depends(require_role(Role.ANALYST))]
 )
 @limiter.limit("10/minute")
 async def analyze_voice(
@@ -2500,7 +2682,7 @@ async def analyze_voice(
     description="Innovation 4: Predicts mule accounts before first transaction using 12 features",
     dependencies=[Depends(require_role(Role.ANALYST))]
 )
-def score_account_opening(
+async def score_account_opening(
     request: AccountOpeningRequest,
     mule_scorer=Depends(get_mule_scorer),
 ):
@@ -2516,8 +2698,9 @@ def score_account_opening(
         if not hasattr(mule_scorer, "MAX_HISTORY_SIZE"):
             mule_scorer.MAX_HISTORY_SIZE = 10000
 
-        # Score the account opening
-        result = mule_scorer.score_account_opening(
+        # Score the account opening using thread pool to prevent blocking event loop
+        result = await asyncio.to_thread(
+            mule_scorer.score_account_opening,
             account_id=request.account_id,
             name=request.name,
             age=request.age,
@@ -2567,9 +2750,12 @@ def score_account_opening(
     description="Innovation 3: Alias for mule assessment endpoint",
     dependencies=[Depends(require_role(Role.ANALYST))]
 )
-def assess_mule_risk(request: AccountOpeningRequest):
+async def assess_mule_risk(
+    request: AccountOpeningRequest,
+    mule_scorer=Depends(get_mule_scorer),
+):
     """Alias endpoint for mule assessment"""
-    return score_account_opening(request)
+    return await score_account_opening(request, mule_scorer=mule_scorer)
 
 
 @app.get(
@@ -3047,307 +3233,10 @@ def _serialise_case(case) -> FraudCaseResponse:
     )
 
 
-@app.post(
-    "/api/v1/cases",
-    response_model=FraudCaseResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Create a new fraud investigation case",
-)
-async def create_case(
-    request: CreateCaseRequest,
-    x_analyst_id: Optional[str] = Header(default="system", alias="X-Analyst-ID"),
-):
-    """Open a new fraud investigation case from a detected alert."""
-    store = get_case_store()
-    priority = CasePriority(request.priority or "MEDIUM")
-    case = store.create_case(
-        transaction_id=request.transaction_id,
-        risk_score=request.risk_score,
-        decision=request.decision,
-        analyst_id=x_analyst_id or "system",
-        priority=priority,
-        tags=request.tags or [],
-    )
-    return _serialise_case(case)
 
+from .cases_routes import router as cases_router
+app.include_router(cases_router)
 
-@app.get(
-    "/api/v1/cases",
-    response_model=CaseListResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="List all fraud investigation cases with filters and pagination",
-)
-async def list_cases(
-    status: Optional[str] = Query(default=None, description="Filter by status"),
-    priority: Optional[str] = Query(default=None, description="Filter by priority"),
-    assigned_analyst: Optional[str] = Query(default=None, description="Filter by analyst ID"),
-    page: int = Query(default=1, ge=1, description="Page number"),
-    page_size: int = Query(default=20, ge=1, le=100, description="Page size"),
-):
-    """Return a paginated, filterable list of all fraud cases."""
-    store = get_case_store()
-    status_filter = CaseStatus(status) if status else None
-    priority_filter = CasePriority(priority) if priority else None
-    cases, total = store.list_cases(
-        status=status_filter,
-        priority=priority_filter,
-        assigned_analyst=assigned_analyst,
-        page=page,
-        page_size=page_size,
-    )
-    import math
-    total_pages = math.ceil(total / page_size) if total > 0 else 1
-    return CaseListResponse(
-        cases=[_serialise_case(c) for c in cases],
-        total=total,
-        page=page,
-        page_size=page_size,
-        total_pages=total_pages,
-    )
-
-
-@app.get(
-    "/api/v1/cases/dashboard",
-    response_model=CaseDashboardResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Aggregated case management dashboard statistics",
-)
-async def get_case_dashboard():
-    """Return aggregated counts of cases by status and priority."""
-    store = get_case_store()
-    stats = store.get_dashboard_stats()
-    return CaseDashboardResponse(**stats)
-
-
-@app.get(
-    "/api/v1/cases/{case_id}",
-    response_model=FraudCaseResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Get full details of a fraud case",
-)
-async def get_case(case_id: str):
-    """Return full details of a specific fraud case."""
-    store = get_case_store()
-    case = store.get_case(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found.")
-    return _serialise_case(case)
-
-
-@app.patch(
-    "/api/v1/cases/{case_id}",
-    response_model=FraudCaseResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ADMIN))],
-    summary="Update status, assignment, or priority of a case",
-    description=(
-        "Partially update a fraud case (status, assigned analyst, or priority). "
-        "**Required role: ADMIN** — this is a privileged mutation that changes "
-        "authoritative case data."
-    ),
-)
-async def update_case(
-    case_id: str,
-    request: UpdateCaseRequest,
-    x_analyst_id: Optional[str] = Header(default="system", alias="X-Analyst-ID"),
-):
-    """Partially update a fraud case (status, assigned analyst, or priority)."""
-    store = get_case_store()
-    analyst = x_analyst_id or "system"
-    try:
-        case = store.get_case(case_id)
-        if case is None:
-            raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found.")
-        if request.status:
-            store.update_status(case_id, CaseStatus(request.status), analyst)
-        if request.assigned_analyst:
-            store.assign_analyst(case_id, request.assigned_analyst, analyst)
-        if request.priority:
-            store.update_priority(case_id, CasePriority(request.priority), analyst)
-        case = store.get_case(case_id)
-        return _serialise_case(case)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post(
-    "/api/v1/cases/{case_id}/claim",
-    response_model=FraudCaseResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Claim an unassigned case",
-)
-async def claim_case(
-    case_id: str,
-    x_analyst_id: Optional[str] = Header(default="system", alias="X-Analyst-ID"),
-):
-    """Analyst claims an unassigned case to begin investigation."""
-    store = get_case_store()
-    analyst = x_analyst_id or "system"
-    try:
-        case = store.claim_case(case_id, analyst)
-        return _serialise_case(case)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post(
-    "/api/v1/cases/{case_id}/comments",
-    response_model=CaseCommentResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Add an investigation note to a case",
-)
-async def add_case_comment(
-    case_id: str,
-    request: AddCommentRequest,
-    x_analyst_id: Optional[str] = Header(default="system", alias="X-Analyst-ID"),
-):
-    """Attach an investigation note or comment to a fraud case."""
-    store = get_case_store()
-    analyst = x_analyst_id or "system"
-    try:
-        comment = store.add_comment(case_id, analyst, request.text)
-        return CaseCommentResponse(
-            comment_id=comment.comment_id,
-            case_id=comment.case_id,
-            analyst_id=comment.analyst_id,
-            text=comment.text,
-            created_at=comment.created_at,
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post(
-    "/api/v1/cases/{case_id}/evidence",
-    response_model=CaseEvidenceResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Attach evidence to a fraud case",
-)
-async def add_case_evidence(
-    case_id: str,
-    request: AddEvidenceRequest,
-    x_analyst_id: Optional[str] = Header(default="system", alias="X-Analyst-ID"),
-):
-    """Attach a piece of evidence (transaction link, graph snapshot, etc.) to a case."""
-    store = get_case_store()
-    analyst = x_analyst_id or "system"
-    try:
-        evidence = store.add_evidence(
-            case_id=case_id,
-            analyst_id=analyst,
-            evidence_type=EvidenceType(request.evidence_type),
-            description=request.description,
-            reference_id=request.reference_id,
-        )
-        return CaseEvidenceResponse(
-            evidence_id=evidence.evidence_id,
-            case_id=evidence.case_id,
-            analyst_id=evidence.analyst_id,
-            evidence_type=evidence.evidence_type.value,
-            description=evidence.description,
-            reference_id=evidence.reference_id,
-            created_at=evidence.created_at,
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get(
-    "/api/v1/cases/{case_id}/timeline",
-    response_model=CaseTimelineResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.AUDITOR))],
-    summary="Get the immutable audit trail for a case",
-)
-async def get_case_timeline(case_id: str):
-    """Return the full chronological audit trail for a fraud case."""
-    store = get_case_store()
-    try:
-        events = store.get_timeline(case_id)
-        return CaseTimelineResponse(
-            case_id=case_id,
-            events=[
-                CaseAuditEventResponse(
-                    event_id=e.event_id,
-                    case_id=e.case_id,
-                    analyst_id=e.analyst_id,
-                    action=e.action,
-                    old_value=e.old_value,
-                    new_value=e.new_value,
-                    timestamp=e.timestamp,
-                )
-                for e in events
-            ],
-            total_events=len(events),
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-# ============================================================================
-# CASE SIMILARITY & SEMANTIC RETRIEVAL (RAG System)
-# ============================================================================
-
-@app.post(
-    "/api/v1/cases/similar-cases",
-    response_model=SimilarCaseResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Find similar fraud cases using semantic retrieval",
-)
-@app.post(
-    "/api/v1/cases/generate-embedding",
-    response_model=GenerateEmbeddingResponse,
-    tags=["Case Management"],
-    dependencies=[Depends(require_role(Role.ANALYST))],
-    summary="Generate semantic embedding for fraud investigation text",
-)
-async def generate_case_embedding(
-    request: GenerateEmbeddingRequest,
-):
-    """
-    Generate a semantic embedding for arbitrary fraud-related text.
-
-    Useful for:
-    - Investigation workflows
-    - Semantic search validation
-    - Embedding diagnostics
-    - RAG pipeline verification
-    """
-    try:
-        from src.embeddings import get_embedder
-
-        embedder = get_embedder()
-
-        embedding = embedder.embed_text(request.text)
-
-        return GenerateEmbeddingResponse(
-            embedding_dimension=len(embedding),
-            embedding_preview=[
-                float(x)
-                for x in embedding[:10]
-            ],
-            timestamp=datetime.utcnow().isoformat() + "Z",
-        )
-
-    except Exception as e:
-        _api_logger.error(f"Error generating embedding: {e}")
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error generating embedding: {str(e)}",
-        )
 @app.get(
     "/api/v1/cases/investigation-insights/{case_id}",
     response_model=InvestigationInsightsResponse,
@@ -3472,7 +3361,7 @@ async def find_similar_cases(request: SimilarCaseRequest):
             query_text_used=query_used,
             reference_case_id=reference_case,
             processing_time_ms=processing_time,
-            timestamp=datetime.utcnow().isoformat() + "Z",
+            timestamp=datetime.now(timezone.utc).isoformat() + "Z",
         )
     
     except Exception as e:

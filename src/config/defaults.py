@@ -32,6 +32,8 @@ DEFAULT_MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "100"))
 DEFAULT_GRAPH_PATH = Path(os.getenv("GRAPH_PATH", "data/synthetic/graph.graphml"))
 DEFAULT_GRAPH_ALLOWED_SUFFIX = os.getenv("GRAPH_ALLOWED_SUFFIX", ".graphml")
 DEFAULT_GRAPH_LOAD_TIMEOUT_SECONDS = int(os.getenv("GRAPH_LOAD_TIMEOUT_SECONDS", "30"))
+DEFAULT_BACKUP_DIRECTORY = Path(os.getenv("BACKUP_DIRECTORY", "backups"))
+DEFAULT_BACKUP_TOOL_PATH = os.getenv("BACKUP_TOOL_PATH")
 
 DEFAULT_RISK_THRESHOLDS = {
     "allow": float(os.getenv("RISK_THRESHOLD_ALLOW", "0.50")),
@@ -66,8 +68,10 @@ DEFAULT_PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9090"))
 
 DEFAULT_DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 DEFAULT_SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+DEFAULT_TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
 DEFAULT_ENABLE_DISCORD_WEBHOOK = os.getenv("ENABLE_DISCORD_WEBHOOK", "false").lower() in ("true", "1", "yes")
 DEFAULT_ENABLE_SLACK_WEBHOOK = os.getenv("ENABLE_SLACK_WEBHOOK", "false").lower() in ("true", "1", "yes")
+DEFAULT_ENABLE_TEAMS_WEBHOOK = os.getenv("ENABLE_TEAMS_WEBHOOK", "false").lower() in ("true", "1", "yes")
 # Global kill-switch: when False, all webhook notifications are suppressed
 # regardless of the per-service ENABLE_DISCORD_WEBHOOK / ENABLE_SLACK_WEBHOOK flags.
 DEFAULT_ENABLE_WEBHOOK_ALERTS = os.getenv("ENABLE_WEBHOOK_ALERTS", "false").lower() in ("true", "1", "yes")

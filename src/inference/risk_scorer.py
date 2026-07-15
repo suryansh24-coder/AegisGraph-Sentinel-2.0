@@ -15,6 +15,8 @@ detection limits and sensitivity values.
 import logging
 logger = logging.getLogger(__name__)
 import torch
+# Bound PyTorch intra-op threads to prevent CPU starvation under high concurrency
+torch.set_num_threads(1)
 import numpy as np
 import weakref
 from threading import Lock
@@ -368,6 +370,43 @@ class RiskScorer:
         return confidence
 
 
+_CACHED_SCORER: Optional[CentralRiskScorer] = None
+_CACHED_SCORER_LOCK = Lock()
+
+def _get_central_scorer(config: dict) -> CentralRiskScorer:
+    global _CACHED_SCORER
+    if _CACHED_SCORER is None:
+        with _CACHED_SCORER_LOCK:
+            if _CACHED_SCORER is None:
+                rs = config.get('risk_scoring', {})
+                caller_thresholds = rs.get('thresholds', {})
+                thresholds = {
+                    'allow': caller_thresholds.get('allow', config_defaults.DEFAULT_RISK_THRESHOLDS["allow"]),
+                    'review': caller_thresholds.get('review', config_defaults.DEFAULT_RISK_THRESHOLDS["review"]),
+                    'block': caller_thresholds.get('block', config_defaults.DEFAULT_RISK_THRESHOLDS["block"]),
+                }
+
+                caller_weights = rs.get('weights', {})
+                component_weights = {
+                    'graph': caller_weights.get('graph', config_defaults.DEFAULT_COMPONENT_WEIGHTS["graph"]),
+                    'velocity': caller_weights.get('velocity', config_defaults.DEFAULT_COMPONENT_WEIGHTS["velocity"]),
+                    'behavior': caller_weights.get('behavior', config_defaults.DEFAULT_COMPONENT_WEIGHTS["behavior"]),
+                    'entropy': caller_weights.get('entropy', config_defaults.DEFAULT_COMPONENT_WEIGHTS["entropy"]),
+                }
+
+                central_thresholds = ThresholdConfig(thresholds=thresholds)
+                _CACHED_SCORER = CentralRiskScorer(
+                    threshold_config=central_thresholds,
+                    component_weights=component_weights,
+                )
+    return _CACHED_SCORER
+
+def invalidate_scorer_cache():
+    global _CACHED_SCORER
+    with _CACHED_SCORER_LOCK:
+        _CACHED_SCORER = None
+
+
 def compute_risk_score(
     transaction: dict,
     biometrics: Optional[dict] = None,
@@ -491,9 +530,12 @@ def compute_risk_score(
                 with lock:
                     G = subgraph_cache.get(source_account)
                 if G is None:
-                    G = transaction_graph.get_approx_subgraph(source_account, max_hops=2)
+                    G_candidate = transaction_graph.get_approx_subgraph(source_account, max_hops=2)
                     with lock:
-                        subgraph_cache[source_account] = G
+                        G = subgraph_cache.get(source_account)
+                        if G is None:
+                            subgraph_cache[source_account] = G_candidate
+                            G = G_candidate
             else:
                 G = transaction_graph.get_approx_subgraph(source_account, max_hops=2)
         else:
@@ -563,17 +605,16 @@ def compute_risk_score(
     lateral_movement_reason = ""
     
     if graph_loaded and transaction_graph:
-        if hasattr(transaction_graph, "is_active") and transaction_graph.is_active:
-            G = transaction_graph.get_approx_subgraph(source_account, max_hops=2)
-            has_node = G.has_node(source_account)
-        else:
-            G = transaction_graph
-            has_node = source_account in G.nodes if hasattr(G, "nodes") else False
+        has_node = (
+            graph_view.has_node(source_account)
+            if hasattr(graph_view, "has_node")
+            else source_account in graph_view.nodes
+        )
 
         if has_node:
             try:
                 if centrality is None:
-                    centrality = _get_betweenness_centrality(G)
+                    centrality = _get_betweenness_centrality(graph_view)
                 if source_account in centrality:
                     current_score = centrality[source_account]
                     
@@ -582,19 +623,18 @@ def compute_risk_score(
                     with lock:
                         if source_account not in centrality_baseline:
                             centrality_baseline[source_account] = []
-                        
-                        baseline_history = centrality_baseline[source_account]
-                    
-                    if len(baseline_history) >= 3:
-                        baseline_avg = np.mean(baseline_history)
-                        baseline_std = np.std(baseline_history) if len(baseline_history) > 1 else 0.001
-                        
+                        baseline_snapshot = list(centrality_baseline[source_account])
+
+                    if len(baseline_snapshot) >= 3:
+                        baseline_avg = np.mean(baseline_snapshot)
+                        baseline_std = np.std(baseline_snapshot) if len(baseline_snapshot) > 1 else 0.001
+
                         # Spike detection: configurable thresholds (from thresholds.yaml)
                         spike_threshold = max(
                             baseline_avg + config_defaults.DEFAULT_LATERAL_MOVEMENT_STD_MULTIPLIER * baseline_std,
                             baseline_avg * config_defaults.DEFAULT_LATERAL_MOVEMENT_THRESHOLD_MULTIPLIER
                         )
-                        
+
                         if current_score > spike_threshold and baseline_avg > 0:
                             lateral_movement_detected = True
                             lateral_movement_reason = f"Lateral movement detected: {source_account} betweenness centrality spiked from baseline {baseline_avg:.4f} to {current_score:.4f} (MITRE ATT&CK TA0008)"
@@ -607,12 +647,14 @@ def compute_risk_score(
                                     "current_score": current_score,
                                 },
                             )
-                    
+
                     # Update baseline (rolling window, thread-safe)
                     with lock:
-                        baseline_history.append(current_score)
-                        if len(baseline_history) > centrality_window_size:
-                            baseline_history.pop(0)
+                        live_history = centrality_baseline.get(source_account, [])
+                        live_history.append(current_score)
+                        if len(live_history) > centrality_window_size:
+                            live_history.pop(0)
+                        centrality_baseline[source_account] = live_history
                         
             except Exception as e:
                 pass
@@ -704,27 +746,7 @@ def compute_risk_score(
     entropy_risk = min(entropy_risk, 1.0)
     breakdown['entropy'] = entropy_risk
 
-    rs = config.get('risk_scoring', {})
-    caller_thresholds = rs.get('thresholds', {})
-    thresholds = {
-        'allow': caller_thresholds.get('allow', config_defaults.DEFAULT_RISK_THRESHOLDS["allow"]),
-        'review': caller_thresholds.get('review', config_defaults.DEFAULT_RISK_THRESHOLDS["review"]),
-        'block': caller_thresholds.get('block', config_defaults.DEFAULT_RISK_THRESHOLDS["block"]),
-    }
-
-    caller_weights = rs.get('weights', {})
-    component_weights = {
-        'graph': caller_weights.get('graph', config_defaults.DEFAULT_COMPONENT_WEIGHTS["graph"]),
-        'velocity': caller_weights.get('velocity', config_defaults.DEFAULT_COMPONENT_WEIGHTS["velocity"]),
-        'behavior': caller_weights.get('behavior', config_defaults.DEFAULT_COMPONENT_WEIGHTS["behavior"]),
-        'entropy': caller_weights.get('entropy', config_defaults.DEFAULT_COMPONENT_WEIGHTS["entropy"]),
-    }
-
-    central_thresholds = ThresholdConfig(thresholds=thresholds)
-    central_scorer = CentralRiskScorer(
-        threshold_config=central_thresholds,
-        component_weights=component_weights,
-    )
+    central_scorer = _get_central_scorer(config)
     assessment = central_scorer.assess(breakdown)
     
     return {

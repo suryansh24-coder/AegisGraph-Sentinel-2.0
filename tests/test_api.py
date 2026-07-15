@@ -487,6 +487,7 @@ class TestApiModuleFallbacks:
             "account_profiles",
             {"mule_acc_001": {"avg_transaction_amount": 10000}},
         )
+        monkeypatch.setattr(api_main.state, "mule_accounts", {"mule_acc_001", "suspect_account_1"})
 
         result = api_main._fallback_compute_risk_score(
             {
@@ -539,8 +540,105 @@ class TestApiModuleFallbacks:
         )
 
         assert result["decision"] == "ALLOW"
-        assert api_main._compute_risk_score_impl is api_main._fallback_compute_risk_score
-        assert api_main._generate_explanation_impl is api_main._fallback_generate_explanation
+        assert api_main._compute_risk_score_impl is None
+        assert api_main._generate_explanation_impl is None
+
+    def test_wrapper_uses_production_path_when_runtime_graph_exists_without_kwarg(self, monkeypatch):
+        graph = api_main.nx.DiGraph()
+        graph.add_edge("acct_src", "acct_dst")
+
+        monkeypatch.setattr(api_main, "MODEL_AVAILABLE", True)
+        monkeypatch.setattr(api_main.state, "graph_loaded", True)
+        monkeypatch.setattr(api_main.state, "transaction_graph", graph)
+        monkeypatch.setattr(api_main.state, "mule_accounts", {"acct_src"})
+        monkeypatch.setattr(api_main.state, "account_profiles", {})
+
+        calls = {}
+
+        def fake_compute_risk_score(transaction: dict, biometrics: dict = None, **kwargs):
+            calls["kwargs"] = kwargs
+            return {
+                "risk_score": 0.42,
+                "decision": "REVIEW",
+                "confidence": 0.91,
+                "breakdown": {"graph": 0.1, "velocity": 0.2, "behavior": 0.0, "entropy": 0.1},
+            }
+
+        fallback_called = Mock(side_effect=AssertionError("fallback path should not be used"))
+        monkeypatch.setattr(api_main, "_compute_risk_score_impl", fake_compute_risk_score)
+        monkeypatch.setattr(api_main, "_fallback_compute_risk_score", fallback_called)
+
+        result = api_main.compute_risk_score(
+            {"source_account": "acct_src", "target_account": "acct_dst", "amount": 1000.0}
+        )
+
+        assert result["decision"] == "REVIEW"
+        assert calls["kwargs"]["graph_loaded"] is True
+        assert calls["kwargs"]["transaction_graph"] is graph
+        assert calls["kwargs"]["mule_accounts"] == {"acct_src"}
+        assert calls["kwargs"]["account_profiles"] == {}
+        fallback_called.assert_not_called()
+
+    def test_wrapper_uses_production_path_when_transaction_graph_is_explicitly_passed(self, monkeypatch):
+        graph = api_main.nx.DiGraph()
+        graph.add_edge("acct_src", "acct_dst")
+
+        monkeypatch.setattr(api_main, "MODEL_AVAILABLE", True)
+        monkeypatch.setattr(api_main.state, "graph_loaded", True)
+        monkeypatch.setattr(api_main.state, "transaction_graph", graph)
+
+        calls = {}
+
+        def fake_compute_risk_score(transaction: dict, biometrics: dict = None, **kwargs):
+            calls["kwargs"] = kwargs
+            return {
+                "risk_score": 0.12,
+                "decision": "ALLOW",
+                "confidence": 0.99,
+                "breakdown": {"graph": 0.0, "velocity": 0.0, "behavior": 0.0, "entropy": 0.0},
+            }
+
+        monkeypatch.setattr(api_main, "_compute_risk_score_impl", fake_compute_risk_score)
+        monkeypatch.setattr(
+            api_main,
+            "_fallback_compute_risk_score",
+            Mock(side_effect=AssertionError("fallback path should not be used")),
+        )
+
+        result = api_main.compute_risk_score(
+            {"source_account": "acct_src", "target_account": "acct_dst", "amount": 1000.0},
+            transaction_graph=graph,
+        )
+
+        assert result["decision"] == "ALLOW"
+        assert calls["kwargs"]["transaction_graph"] is graph
+
+    def test_wrapper_uses_fallback_when_graph_is_unavailable(self, monkeypatch):
+        monkeypatch.setattr(api_main, "MODEL_AVAILABLE", True)
+        monkeypatch.setattr(api_main.state, "graph_loaded", False)
+        monkeypatch.setattr(api_main.state, "transaction_graph", None)
+
+        fallback_result = {
+            "risk_score": 0.87,
+            "decision": "BLOCK",
+            "confidence": 0.75,
+            "breakdown": {"graph": 0.6, "velocity": 0.2, "behavior": 0.0, "entropy": 0.1},
+        }
+
+        fallback_called = Mock(return_value=fallback_result)
+        monkeypatch.setattr(api_main, "_fallback_compute_risk_score", fallback_called)
+        monkeypatch.setattr(
+            api_main,
+            "_compute_risk_score_impl",
+            Mock(side_effect=AssertionError("production path should not be used")),
+        )
+
+        result = api_main.compute_risk_score(
+            {"source_account": "acct_src", "target_account": "acct_dst", "amount": 1000.0}
+        )
+
+        assert result == fallback_result
+        fallback_called.assert_called_once()
 
     def test_fallback_outputs_are_deterministic_for_identical_inputs(self, monkeypatch):
         monkeypatch.setattr(api_main.state, "graph_loaded", False)
@@ -1075,20 +1173,30 @@ class TestAsyncExplainabilityOffload:
         monkeypatch.setattr(api_main, "LATERAL_MOVEMENT_AVAILABLE", False)
 
         try:
-            txn_loop = _RecordingLoop([
-                {
-                    "risk_score": 0.12,
-                    "decision": "ALLOW",
-                    "confidence": 0.91,
-                    "breakdown": {"graph": 0.1, "velocity": 0.1, "behavior": 0.1, "entropy": 0.1},
-                    "lateral_movement_detected": False,
-                },
-                {
-                    "explanation": "generated off thread",
-                    "recommended_action": "monitor",
-                },
-            ])
-            monkeypatch.setattr(api_main.asyncio, "to_thread", txn_loop.to_thread)
+            import concurrent.futures
+            calls = []
+            original_submit = api_main.inference_pool.submit
+            def mock_submit(func, *args, **kwargs):
+                unwrapped_func = getattr(func, "func", func)
+                calls.append((unwrapped_func, args, kwargs))
+                f = concurrent.futures.Future()
+                if unwrapped_func == api_main._run_scoring_pipeline:
+                    f.set_result({
+                        "risk_score": 0.12,
+                        "decision": "ALLOW",
+                        "confidence": 0.91,
+                        "breakdown": {"graph": 0.1, "velocity": 0.1, "behavior": 0.1, "entropy": 0.1},
+                        "lateral_movement_detected": False,
+                    })
+                elif unwrapped_func == api_main.generate_explanation:
+                    f.set_result({
+                        "explanation": "generated off thread",
+                        "recommended_action": "monitor",
+                    })
+                else:
+                    f.set_result(None)
+                return f
+            monkeypatch.setattr(api_main.inference_pool, "submit", mock_submit)
 
             txn_request = api_main.TransactionCheckRequest(
                 transaction_id="txn-379",
@@ -1102,8 +1210,7 @@ class TestAsyncExplainabilityOffload:
 
             txn_response = asyncio.run(api_main.check_transaction(txn_request))
 
-            # Since _analyze_keystrokes_sync is called first, the explanation is the 3rd or 4th call!
-            explanation_call = next((c for c in txn_loop.calls if c[1] is api_main.generate_explanation), None)
+            explanation_call = next((c for c in calls if c[0] is api_main.generate_explanation), None)
             assert explanation_call is not None
             assert txn_response.explanation == "generated off thread"
         finally:
@@ -1185,6 +1292,50 @@ class TestFallbackScoringConfigDriven:
             "Fallback block should use block_score from config (0.91), not hardcoded 0.85"
         )
         assert expected_decision == "BLOCK"
+
+
+class TestDefaultRateLimiting:
+    """Test standard API default rate limiting middleware."""
+
+    def test_standard_api_rate_limiting_enforced(self, monkeypatch):
+        if not api_main.SLOWAPI_AVAILABLE:
+            pytest.skip("SlowAPI is not installed")
+
+        # Set a low rate limit for testing
+        monkeypatch.setattr(api_main.settings.api, "rate_limit", "5/minute")
+
+        # Clear existing rate limit keys to ensure clean state
+        _clear_rate_limit_storage()
+
+        # Let's hit a standard API route (e.g. /api/v1/model/info).
+        # The rate limit middleware runs first (before RBAC verification), so we don't need auth to test this.
+        statuses = []
+        for _ in range(6):
+            response = client.get("/api/v1/model/info")
+            statuses.append(response.status_code)
+
+        # First 5 should not be 429 (they will be 401 or 403 or 200, but not 429)
+        for code in statuses[:5]:
+            assert code != 429, f"Request failed early with {code}"
+
+        # 6th should be 429
+        assert statuses[5] == 429, f"6th request status was {statuses[5]} instead of 429"
+
+        # Check headers of the 429 response
+        last_response = client.get("/api/v1/model/info")
+        assert last_response.status_code == 429
+        assert "Retry-After" in last_response.headers
+        assert int(last_response.headers["Retry-After"]) >= 0
+
+        # Verify that exempt paths like /health are NOT rate limited
+        health_statuses = []
+        for _ in range(10):
+            response = client.get("/health")
+            health_statuses.append(response.status_code)
+        assert all(code == 200 for code in health_statuses)
+
+        # Clean up
+        _clear_rate_limit_storage()
 
 
 if __name__ == "__main__":

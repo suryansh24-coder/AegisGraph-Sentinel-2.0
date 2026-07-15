@@ -174,11 +174,12 @@ def _get_key_role(api_key: str) -> Optional[Role]:
 
     role = _resolve_key_role(provided_hash)
 
-    with _KEY_ROLE_CACHE_LOCK:
-        _KEY_ROLE_CACHE[provided_hash] = (role, now)
-        _KEY_ROLE_CACHE.move_to_end(provided_hash)
-        if len(_KEY_ROLE_CACHE) > _CACHE_MAX:
-            _KEY_ROLE_CACHE.popitem(last=False)
+    if role is not None:
+        with _KEY_ROLE_CACHE_LOCK:
+            _KEY_ROLE_CACHE[provided_hash] = (role, now)
+            _KEY_ROLE_CACHE.move_to_end(provided_hash)
+            if len(_KEY_ROLE_CACHE) > _CACHE_MAX:
+                _KEY_ROLE_CACHE.popitem(last=False)
 
     return role
 
@@ -214,7 +215,7 @@ def verify_api_key(x_api_key: str = Header(None)) -> str:
                 f"{API_KEY_ENV_VAR} environment variable."
             ),
         )
-    if x_api_key != valid_key:
+    if not hmac.compare_digest(x_api_key or "", valid_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
